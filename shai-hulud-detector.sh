@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Shai-Hulud NPM Supply Chain Attack Detection Script
 # Optimized for performance with parallel processing and smart file categorization
@@ -8,6 +8,11 @@ set -eo pipefail
 TEMP_DIR=""
 high_risk=0
 medium_risk=0
+FAST_MODE=false
+RUN_PARANOID=false
+RUN_INTEGRITY=true
+RUN_DESTRUCTIVE=true
+IGNORE_MEDIUM=false
 
 RED='\033[0;31m'
 YELLOW='\033[1;33m'
@@ -17,9 +22,9 @@ NC='\033[0m'
 
 PARALLELISM=4
 if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-  PARALLELISM=$(nproc)
+  PARALLELISM=$(nproc 2>/dev/null || echo 4)
 elif [[ "$OSTYPE" == "darwin"* ]]; then
-  PARALLELISM=$(sysctl -n hw.ncpu)
+  PARALLELISM=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
 fi
 
 # Known malicious file hashes
@@ -39,6 +44,16 @@ MALICIOUS_HASHES=(
     "cbb9bc5a8496243e02f3cc080efbe3e4a1430ba0671f2e43a202bf45b05479cd"
 )
 
+declare -A COMPROMISED_PKG_TABLE
+declare -A LOCKFILE_CACHE
+
+build_package_table() {
+    COMPROMISED_PKG_TABLE=()
+    for entry in "${COMPROMISED_PACKAGES[@]}"; do
+        COMPROMISED_PKG_TABLE["$entry"]=1
+    done
+}
+
 create_temp_dir() {
     local temp_base="${TMPDIR:-${TMP:-${TEMP:-/tmp}}}"
     TEMP_DIR=$(mktemp -d -t shai-hulud-detect-XXXXXX 2>/dev/null || mktemp -d 2>/dev/null || echo "$temp_base/shai-hulud-detect-$$-$(date +%s)")
@@ -46,9 +61,11 @@ create_temp_dir() {
     
     # File lists from single find pass
     touch "$TEMP_DIR/all_js_files.txt"
+    touch "$TEMP_DIR/all_yaml_files.txt"
     touch "$TEMP_DIR/all_package_json.txt"
     touch "$TEMP_DIR/all_workflow_files.txt"
     touch "$TEMP_DIR/all_lockfiles.txt"
+    touch "$TEMP_DIR/all_script_files.txt"
     
     # Findings
     touch "$TEMP_DIR/workflow_files.txt"
@@ -69,6 +86,8 @@ create_temp_dir() {
     touch "$TEMP_DIR/new_workflow_files.txt"
     touch "$TEMP_DIR/github_runners.txt"
     touch "$TEMP_DIR/destructive_patterns.txt"
+    touch "$TEMP_DIR/typosquatting_warnings.txt"
+    touch "$TEMP_DIR/network_exfiltration_warnings.txt"
 }
 
 cleanup_temp_files() {
@@ -84,11 +103,18 @@ print_status() {
 }
 
 usage() {
-    echo "Usage: $0 [--paranoid] [--parallelism N] <directory_to_scan>"
+    echo "Usage: $0 [--paranoid|--no-paranoid] [--fast] [--no-integrity] [--no-destructive] [--ignore-medium] [--parallelism N] <directory_to_scan>"
     echo ""
     echo "OPTIONS:"
-    echo "  --paranoid         Enable additional security checks"
+    echo "  --paranoid         Enable additional security checks (typosquatting, network exfil)"
+    echo "  --no-paranoid      Disable paranoid checks explicitly"
+    echo "  --fast             Skip heavy checks (paranoid + lockfile integrity)"
+    echo "  --no-integrity     Skip lockfile integrity verification"
+    echo "  --no-destructive   Skip destructive pattern scanning"
+    echo "  --ignore-medium    Treat medium findings as informational (exit code 0 unless high risk)"
     echo "  --parallelism N    Set threads (current: ${PARALLELISM})"
+    echo ""
+    echo "Requires Bash 5+"
     exit 1
 }
 
@@ -143,11 +169,19 @@ collect_files() {
     find "$scan_dir" \
         \( -path "*/node_modules/.cache" -o -path "*/node_modules/.bin" -o -path "*/node_modules/.staging" \) -prune -o \
         -type f \( -name "setup_bun.js" -o -name "bun_environment.js" \) -print 2>/dev/null > "$TEMP_DIR/bun_attack_files.txt" &
-    
+
     find "$scan_dir" \
         \( -path "*/node_modules/.cache" -o -path "*/node_modules/.bin" -o -path "*/node_modules/.staging" \) -prune -o \
         -type f \( -name "*.js" -o -name "*.ts" -o -name "*.json" \) ! -name "*.d.ts" ! -name "*.map" -print 2>/dev/null > "$TEMP_DIR/all_js_files.txt" &
-    
+
+    find "$scan_dir" \
+        \( -path "*/node_modules/.cache" -o -path "*/node_modules/.bin" -o -path "*/node_modules/.staging" \) -prune -o \
+        -type f \( -name "*.yml" -o -name "*.yaml" \) -print 2>/dev/null > "$TEMP_DIR/all_yaml_files.txt" &
+
+    find "$scan_dir" \
+        \( -path "*/node_modules/.cache" -o -path "*/node_modules/.bin" -o -path "*/node_modules/.staging" \) -prune -o \
+        -type f \( -name "*.js" -o -name "*.sh" -o -name "*.ps1" -o -name "*.py" -o -name "*.bat" -o -name "*.cmd" \) -print 2>/dev/null > "$TEMP_DIR/all_script_files.txt" &
+
     wait
     
     local js_count=$(wc -l < "$TEMP_DIR/all_js_files.txt" 2>/dev/null | tr -d ' ')
@@ -258,8 +292,13 @@ semver_match() {
 get_lockfile_version_cached() {
     local package_name="$1"
     local package_dir="$2"
-    
-    # Find nearest lockfile
+
+    local cache_key="$package_dir:$package_name"
+    if [[ -n "${LOCKFILE_CACHE[$cache_key]}" ]]; then
+        echo "${LOCKFILE_CACHE[$cache_key]}"
+        return
+    fi
+
     local current_dir="$package_dir"
     while [[ "$current_dir" != "/" && -n "$current_dir" ]]; do
         if [[ -f "$current_dir/package-lock.json" ]]; then
@@ -274,11 +313,34 @@ get_lockfile_version_cached() {
                     }
                 }
             ' "$current_dir/package-lock.json" 2>/dev/null)
+            LOCKFILE_CACHE[$cache_key]="$version"
+            echo "$version"
+            return
+        elif [[ -f "$current_dir/yarn.lock" ]]; then
+            local version
+            version=$(awk -v pkg="$package_name" '
+                $0 ~ "^\"" pkg "@" { in_block=1 }
+                in_block && /version/ {
+                    gsub(/[^0-9A-Za-z\.\-]/, "", $2)
+                    print $2
+                    exit
+                }
+            ' "$current_dir/yarn.lock" 2>/dev/null)
+            LOCKFILE_CACHE[$cache_key]="$version"
+            echo "$version"
+            return
+        elif [[ -f "$current_dir/pnpm-lock.yaml" ]]; then
+            local version
+            version=$(awk -v pkg="/$package_name/" '
+                $0 ~ pkg { if (getline) { if ($0 ~ /version:/) { gsub(/[^0-9A-Za-z\.\-]/,"",$2); print $2; exit } } }
+            ' "$current_dir/pnpm-lock.yaml" 2>/dev/null)
+            LOCKFILE_CACHE[$cache_key]="$version"
             echo "$version"
             return
         fi
         current_dir=$(dirname "$current_dir")
     done
+    LOCKFILE_CACHE[$cache_key]=""
     echo ""
 }
 
@@ -287,14 +349,28 @@ check_packages_fast() {
     
     [[ ! -s "$TEMP_DIR/all_package_json.txt" ]] && return
     
+    local pkg_total pkg_seen
+    pkg_total=$(wc -l < "$TEMP_DIR/all_package_json.txt" | tr -d ' ')
+    pkg_seen=0
+
     while IFS= read -r package_file; do
         [[ ! -r "$package_file" ]] && continue
+        pkg_seen=$((pkg_seen + 1))
+        if [[ $((pkg_seen % 250)) -eq 0 ]]; then
+            echo -ne "\r   Checked $pkg_seen/$pkg_total package.json files" >&2
+        fi
         
         # Extract dependencies in one pass
         awk '/"dependencies":|"devDependencies":/{flag=1;next}/}/{flag=0}flag' "$package_file" | \
         grep -o '"[^"]*"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | while IFS= read -r line; do
             local pkg_name=$(echo "$line" | cut -d'"' -f2)
             local pkg_version=$(echo "$line" | cut -d'"' -f4)
+            [[ -z "$pkg_name" || -z "$pkg_version" ]] && continue
+
+            if [[ -n "${COMPROMISED_PKG_TABLE[$pkg_name:$pkg_version]}" ]]; then
+                echo "$package_file:$pkg_name@$pkg_version" >> "$TEMP_DIR/compromised_found.txt"
+                continue
+            fi
             
             # Check against compromised packages
             for malicious_info in "${COMPROMISED_PACKAGES[@]}"; do
@@ -338,54 +414,70 @@ check_packages_fast() {
             echo "$package_file" >> "$TEMP_DIR/bun_attack_files.txt"
         fi
     done < "$TEMP_DIR/all_package_json.txt"
+
+    echo -ne "\r\033[K" >&2
 }
 
 # Scan content for suspicious patterns with parallel processing
 check_content_patterns_fast() {
     print_status "$BLUE" "🔍 Checking content patterns..."
     
-    [[ ! -s "$TEMP_DIR/all_js_files.txt" ]] && return
-    
-    # Single parallel grep for multiple patterns
-    cat "$TEMP_DIR/all_js_files.txt" | xargs -P "$PARALLELISM" grep -l -E \
-        'webhook\.site|bb8ca5f6-4175-45d2-b042-fc9ebb8170b7|0x[a-fA-F0-9]{40}|XMLHttpRequest\.prototype\.send|trufflehog|TruffleHog|AWS_ACCESS_KEY|GITHUB_TOKEN|NPM_TOKEN|SHA1HULUD' \
-        2>/dev/null | while IFS= read -r file; do
-        
-        # Categorize findings
-        if grep -q 'webhook\.site\|bb8ca5f6-4175-45d2-b042-fc9ebb8170b7' "$file" 2>/dev/null; then
-            echo "$file:webhook.site reference" >> "$TEMP_DIR/suspicious_content.txt"
-        fi
-        
-        if grep -q '0x[a-fA-F0-9]\{40\}' "$file" 2>/dev/null; then
-            if grep -q -E 'ethereum|wallet|crypto' "$file" 2>/dev/null; then
-                echo "$file:Ethereum wallet patterns" >> "$TEMP_DIR/crypto_patterns.txt"
+    # Single parallel grep for multiple patterns in JS/TS/JSON
+    if [[ -s "$TEMP_DIR/all_js_files.txt" ]]; then
+        cat "$TEMP_DIR/all_js_files.txt" | xargs -P "$PARALLELISM" grep -l -E \
+            'webhook\.site|bb8ca5f6-4175-45d2-b042-fc9ebb8170b7|0x[a-fA-F0-9]{40}|XMLHttpRequest\.prototype\.send|trufflehog|TruffleHog|AWS_ACCESS_KEY|GITHUB_TOKEN|NPM_TOKEN|SHA1HULUD' \
+            2>/dev/null | while IFS= read -r file; do
+            
+            # Categorize findings
+            if grep -q 'webhook\.site\|bb8ca5f6-4175-45d2-b042-fc9ebb8170b7' "$file" 2>/dev/null; then
+                echo "$file:webhook.site reference" >> "$TEMP_DIR/suspicious_content.txt"
             fi
-        fi
-        
-        if grep -q 'XMLHttpRequest\.prototype\.send' "$file" 2>/dev/null; then
-            if [[ "$file" == *"/react-native/"* || "$file" == *"/next/dist/"* ]]; then
-                if grep -q -E '0x[a-fA-F0-9]{40}|webhook\.site' "$file" 2>/dev/null; then
-                    echo "$file:XMLHttpRequest with crypto - HIGH RISK" >> "$TEMP_DIR/crypto_patterns.txt"
+            
+            if grep -q '0x[a-fA-F0-9]\{40\}' "$file" 2>/dev/null; then
+                if grep -q -E 'ethereum|wallet|crypto' "$file" 2>/dev/null; then
+                    echo "$file:Ethereum wallet patterns" >> "$TEMP_DIR/crypto_patterns.txt"
                 fi
-            else
-                echo "$file:XMLHttpRequest modification" >> "$TEMP_DIR/crypto_patterns.txt"
             fi
-        fi
-        
-        if grep -q 'trufflehog\|TruffleHog' "$file" 2>/dev/null; then
-            if [[ "$file" != *".md" && "$file" != *".txt" ]]; then
-                if grep -q 'subprocess.*curl\|download.*trufflehog' "$file" 2>/dev/null; then
-                    echo "$file:HIGH:Suspicious trufflehog execution" >> "$TEMP_DIR/trufflehog_activity.txt"
+            
+            if grep -q 'XMLHttpRequest\.prototype\.send' "$file" 2>/dev/null; then
+                if [[ "$file" == *"/react-native/"* || "$file" == *"/next/dist/"* ]]; then
+                    if grep -q -E '0x[a-fA-F0-9]{40}|webhook\.site' "$file" 2>/dev/null; then
+                        echo "$file:XMLHttpRequest with crypto - HIGH RISK" >> "$TEMP_DIR/crypto_patterns.txt"
+                    fi
                 else
-                    echo "$file:MEDIUM:Trufflehog reference" >> "$TEMP_DIR/trufflehog_activity.txt"
+                    echo "$file:XMLHttpRequest modification" >> "$TEMP_DIR/crypto_patterns.txt"
                 fi
             fi
-        fi
-        
-        if grep -q 'SHA1HULUD' "$file" 2>/dev/null; then
-            echo "$file" >> "$TEMP_DIR/github_runners.txt"
-        fi
-    done
+            
+            if grep -q 'trufflehog\|TruffleHog' "$file" 2>/dev/null; then
+                if [[ "$file" != *".md" && "$file" != *".txt" ]]; then
+                    if grep -q 'subprocess.*curl\|download.*trufflehog' "$file" 2>/dev/null; then
+                        echo "$file:HIGH:Suspicious trufflehog execution" >> "$TEMP_DIR/trufflehog_activity.txt"
+                    else
+                        echo "$file:MEDIUM:Trufflehog reference" >> "$TEMP_DIR/trufflehog_activity.txt"
+                    fi
+                fi
+            fi
+            
+            if grep -q 'SHA1HULUD' "$file" 2>/dev/null; then
+                echo "$file" >> "$TEMP_DIR/github_runners.txt"
+            fi
+        done
+    fi
+
+    # YAML/workflow scanning for the same IOC patterns
+    if [[ -s "$TEMP_DIR/all_yaml_files.txt" ]]; then
+        cat "$TEMP_DIR/all_yaml_files.txt" | xargs -P "$PARALLELISM" grep -l -E \
+            'webhook\.site|bb8ca5f6-4175-45d2-b042-fc9ebb8170b7|AWS_ACCESS_KEY|GITHUB_TOKEN|NPM_TOKEN|SHA1HULUD' \
+            2>/dev/null | while IFS= read -r file; do
+                if grep -q 'webhook\.site\|bb8ca5f6-4175-45d2-b042-fc9ebb8170b7' "$file" 2>/dev/null; then
+                    echo "$file:webhook.site reference" >> "$TEMP_DIR/suspicious_content.txt"
+                fi
+                if grep -q 'SHA1HULUD' "$file" 2>/dev/null; then
+                    echo "$file" >> "$TEMP_DIR/github_runners.txt"
+                fi
+            done
+    fi
 }
 
 # Check git repositories for suspicious branches and names
@@ -447,10 +539,91 @@ check_workflows_fast() {
 check_destructive_fast() {
     print_status "$BLUE" "🔍 Checking for destructive patterns..."
     
-    find "$1" -type f \( -name "*.js" -o -name "*.sh" -o -name "*.ps1" \) 2>/dev/null | head -1000 | \
-    xargs -P "$PARALLELISM" grep -l -E 'rm -rf \$HOME|rm -rf ~|fs\.rmSync.*recursive|Remove-Item -Recurse' 2>/dev/null | \
-    while IFS= read -r file; do
-        echo "$file:Destructive pattern detected" >> "$TEMP_DIR/destructive_patterns.txt"
+    [[ "$RUN_DESTRUCTIVE" != "true" ]] && return
+    [[ ! -s "$TEMP_DIR/all_script_files.txt" ]] && return
+
+    # Skip common build artifacts to reduce false positives
+    local exclude_regex='node_modules|/dist/|/build/|/.next/'
+
+    # Hard destructive patterns that explicitly target home dirs
+    cat "$TEMP_DIR/all_script_files.txt" | xargs -P "$PARALLELISM" grep -l -E \
+        'rm -rf \$HOME|rm -rf ~|fs\.rmSync.*recursive|Remove-Item -Recurse' 2>/dev/null | \
+        grep -v -E "$exclude_regex" | \
+        while IFS= read -r file; do
+            echo "$file:Destructive pattern detected" >> "$TEMP_DIR/destructive_patterns.txt"
+        done
+
+    # Rimraf: only flag if it references home/user paths
+    cat "$TEMP_DIR/all_script_files.txt" | xargs -P "$PARALLELISM" grep -l 'rimraf' 2>/dev/null | \
+        grep -v -E "$exclude_regex" | \
+        while IFS= read -r file; do
+            if grep -qE 'rimraf.*(HOME|~|/users?|/home)' "$file" 2>/dev/null; then
+                echo "$file:Destructive rimraf targeting home directory" >> "$TEMP_DIR/destructive_patterns.txt"
+            fi
+        done
+}
+
+check_typosquatting() {
+    print_status "$BLUE" "🔍+ Checking for typosquatting/homoglyphs (paranoid)..."
+    [[ ! -s "$TEMP_DIR/all_package_json.txt" ]] && return
+
+    local popular_packages=(
+        "react" "vue" "angular" "express" "lodash" "axios" "typescript"
+        "webpack" "babel" "eslint" "jest" "mocha" "chalk" "debug"
+        "commander" "inquirer" "yargs" "request" "moment" "underscore"
+        "jquery" "bootstrap" "socket.io" "redis" "mongoose" "passport"
+    )
+
+    while IFS= read -r package_file; do
+        [[ ! -r "$package_file" ]] && continue
+        local package_names
+        package_names=$(awk '
+            /^[[:space:]]*"dependencies"[[:space:]]*:/ { in_deps=1; next }
+            /^[[:space:]]*"devDependencies"[[:space:]]*:/ { in_deps=1; next }
+            /^[[:space:]]*"peerDependencies"[[:space:]]*:/ { in_deps=1; next }
+            /^[[:space:]]*"optionalDependencies"[[:space:]]*:/ { in_deps=1; next }
+            /^[[:space:]]*}/ && in_deps { in_deps=0; next }
+            in_deps && /^[[:space:]]*"[^"]+":/ {
+                gsub(/^[[:space:]]*"/, "", $0)
+                gsub(/".*$/, "", $0)
+                if (length($0) > 1) print $0
+            }
+        ' "$package_file" | sort -u)
+
+        while IFS= read -r package_name; do
+            [[ -z "$package_name" ]] && continue
+            # Non-ascii characters
+            if ! LC_ALL=C echo "$package_name" | grep -q '^[a-zA-Z0-9@/._-]*$'; then
+                echo "$package_file:Potential Unicode/homoglyph in $package_name" >> "$TEMP_DIR/typosquatting_warnings.txt"
+            fi
+            # Single-char distance to popular packages (rough)
+            for popular in "${popular_packages[@]}"; do
+                [[ "$package_name" == "$popular" ]] && continue
+                if [[ ${#package_name} -eq ${#popular} && ${#package_name} -gt 4 ]]; then
+                    local diff=0
+                    for ((i=0;i<${#package_name};i++)); do
+                        [[ "${package_name:$i:1}" != "${popular:$i:1}" ]] && diff=$((diff+1))
+                        [[ $diff -gt 1 ]] && break
+                    done
+                    [[ $diff -eq 1 ]] && echo "$package_file:Potential typosquat of $popular -> $package_name" >> "$TEMP_DIR/typosquatting_warnings.txt"
+                fi
+            done
+        done <<< "$package_names"
+    done < "$TEMP_DIR/all_package_json.txt"
+}
+
+check_network_exfiltration() {
+    print_status "$BLUE" "🔍+ Checking for network exfiltration patterns (paranoid)..."
+
+    # Scan JS/TS/JSON and YAML for suspicious domains/IPs and base64+network combos
+    local domains='npmjs\\.help|webhook\\.site|ngrok|tunnel|pastebin|requestbin'
+    local ips='([0-9]{1,3}\\.){3}[0-9]{1,3}'
+
+    for list in "$TEMP_DIR/all_js_files.txt" "$TEMP_DIR/all_yaml_files.txt"; do
+        [[ ! -s "$list" ]] && continue
+        cat "$list" | xargs -P "$PARALLELISM" grep -n -E "$domains|$ips|DNS-over-HTTPS|DoH|base64.decode|atob\\(" 2>/dev/null | while IFS=: read -r file line rest; do
+            echo "$file:Suspicious network pattern near line $line" >> "$TEMP_DIR/network_exfiltration_warnings.txt"
+        done
     done
 }
 
@@ -670,14 +843,14 @@ generate_report() {
     
     # Trufflehog HIGH risk
     if [[ -s "$TEMP_DIR/trufflehog_activity.txt" ]]; then
-        grep "^.*:HIGH:" "$TEMP_DIR/trufflehog_activity.txt" 2>/dev/null | while IFS=: read -r file level activity; do
+        while IFS=: read -r file level activity; do
             if [[ "$level" == "HIGH" ]]; then
                 print_status "$RED" "🚨 HIGH RISK: Trufflehog activity:"
                 echo "   - $file"
                 echo "     Activity: $activity"
                 high_risk=$((high_risk+1))
             fi
-        done
+        done < <(grep "^.*:HIGH:" "$TEMP_DIR/trufflehog_activity.txt" 2>/dev/null)
     fi
     
     # Shai-Hulud repos
@@ -740,6 +913,17 @@ generate_report() {
         done < "$TEMP_DIR/suspicious_content.txt"
         echo
     fi
+
+    if [[ -s "$TEMP_DIR/trufflehog_activity.txt" ]]; then
+        print_status "$YELLOW" "⚠️  MEDIUM RISK: Trufflehog references:"
+        while IFS=: read -r file level activity; do
+            [[ "$level" != "MEDIUM" ]] && continue
+            echo "   - $file"
+            echo "     Activity: $activity"
+            medium_risk=$((medium_risk+1))
+        done < <(grep "^.*:MEDIUM:" "$TEMP_DIR/trufflehog_activity.txt" 2>/dev/null)
+        echo
+    fi
     
     if [[ -s "$TEMP_DIR/crypto_patterns.txt" ]]; then
         local has_high=0
@@ -747,18 +931,18 @@ generate_report() {
         
         if [[ $has_high -eq 1 ]]; then
             print_status "$RED" "🚨 HIGH RISK: Crypto theft patterns:"
-            grep "HIGH RISK" "$TEMP_DIR/crypto_patterns.txt" | while IFS=: read -r file pattern; do
+            while IFS=: read -r file pattern; do
                 echo "   - $file"
                 high_risk=$((high_risk+1))
-            done
+            done < <(grep "HIGH RISK" "$TEMP_DIR/crypto_patterns.txt")
             echo
         fi
         
         print_status "$YELLOW" "⚠️  MEDIUM RISK: Crypto patterns:"
-        grep -v "HIGH RISK" "$TEMP_DIR/crypto_patterns.txt" | while IFS=: read -r file pattern; do
+        while IFS=: read -r file pattern; do
             echo "   - $file"
             medium_risk=$((medium_risk+1))
-        done
+        done < <(grep -v "HIGH RISK" "$TEMP_DIR/crypto_patterns.txt")
         echo
     fi
     
@@ -768,6 +952,26 @@ generate_report() {
             echo "   - $repo: $branch"
             medium_risk=$((medium_risk+1))
         done < "$TEMP_DIR/git_branches.txt"
+        echo
+    fi
+
+    if [[ -s "$TEMP_DIR/typosquatting_warnings.txt" ]]; then
+        print_status "$YELLOW" "⚠️  MEDIUM RISK (paranoid): Potential typosquatting:"
+        while IFS=: read -r file info; do
+            echo "   - $file"
+            echo "     $info"
+            medium_risk=$((medium_risk+1))
+        done < "$TEMP_DIR/typosquatting_warnings.txt"
+        echo
+    fi
+
+    if [[ -s "$TEMP_DIR/network_exfiltration_warnings.txt" ]]; then
+        print_status "$YELLOW" "⚠️  MEDIUM RISK (paranoid): Network exfiltration patterns:"
+        while IFS=: read -r file info; do
+            echo "   - $file"
+            echo "     $info"
+            medium_risk=$((medium_risk+1))
+        done < "$TEMP_DIR/network_exfiltration_warnings.txt"
         echo
     fi
     
@@ -796,12 +1000,20 @@ generate_report() {
 }
 
 main() {
-    local paranoid_mode=false
     local scan_dir=""
     
     while [[ $# -gt 0 ]]; do
         case $1 in
-            --paranoid) paranoid_mode=true ;;
+            --paranoid) RUN_PARANOID=true ;;
+            --no-paranoid) RUN_PARANOID=false ;;
+            --fast)
+                FAST_MODE=true
+                RUN_PARANOID=false
+                RUN_INTEGRITY=false
+                ;;
+            --no-integrity) RUN_INTEGRITY=false ;;
+            --no-destructive) RUN_DESTRUCTIVE=false ;;
+            --ignore-medium) IGNORE_MEDIUM=true ;;
             --parallelism)
                 PARALLELISM=$2
                 shift
@@ -821,10 +1033,11 @@ main() {
     scan_dir=$(cd "$scan_dir" && pwd)
     
     print_status "$GREEN" "Starting Shai-Hulud detection..."
-    print_status "$BLUE" "Scanning: $scan_dir (parallelism: $PARALLELISM)"
+    print_status "$BLUE" "Scanning: $scan_dir (parallelism: $PARALLELISM, fast: $FAST_MODE, paranoid: $RUN_PARANOID)"
     echo
     
     load_compromised_packages
+    build_package_table
     create_temp_dir
     
     # Single file collection pass
@@ -837,16 +1050,28 @@ main() {
     check_git_fast "$scan_dir" &
     check_workflows_fast "$scan_dir" &
     check_destructive_fast "$scan_dir" &
-    check_package_integrity "$scan_dir" &
+    if [[ "$RUN_INTEGRITY" == "true" ]]; then
+        check_package_integrity "$scan_dir" &
+    fi
+    if [[ "$RUN_PARANOID" == "true" ]]; then
+        check_typosquatting &
+        check_network_exfiltration &
+    fi
     
     wait
     
     generate_report
     
-    [[ $high_risk -gt 0 ]] && exit 1
-    [[ $medium_risk -gt 0 ]] && exit 2
+    if [[ $high_risk -gt 0 ]]; then
+        exit 1
+    fi
+    if [[ $medium_risk -gt 0 ]]; then
+        if [[ "$IGNORE_MEDIUM" == "true" ]]; then
+            exit 0
+        fi
+        exit 2
+    fi
     exit 0
 }
 
 main "$@"
-
